@@ -1,0 +1,29 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c	2026-02-28 07:33:18.164723720 +1300
++++ b/drivers/net/ethernet/airoha/airoha_npu.c	2026-02-28 07:33:18.178723845 +1300
+@@ -14,6 +14,26 @@
+ 
+ #include "airoha_eth.h"
+ 
++/* Telemetry payload for eBPF ring buffer interception. */
++struct airoha_hw_stats_event {
++	u32 src_ip[4];
++	u32 dst_ip[4];
++	u16 src_port;
++	u16 dst_port;
++	u16 l3_proto;
++	u8 l4_proto;
++	u8 teardown_flag;
++	u64 bytes;
++	u64 packets;
++};
++
++/* No-inline kprobe anchor for eBPF telemetry. */
++static noinline void
++bpf_airoha_npu_telemetry_event(struct airoha_hw_stats_event *e)
++{
++	barrier();
++}
++
+ #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
+ #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
+ #define NPU_AN7583_FIRMWARE_DATA		"airoha/an7583_npu_data.bin"

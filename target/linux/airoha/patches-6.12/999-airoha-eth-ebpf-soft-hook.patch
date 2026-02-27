@@ -1,0 +1,491 @@
+From: Joel Wiramu Pauling <aenertia@aenertia.net>
+Subject: net: airoha: add eBPF soft hook for selective NPU flow offloading
+
+Add Netfilter hooks in airoha_ppe.c that intercept packets marked by a
+TC/BPF ingress program and program the NPU TCAM for hardware offloading:
+
+  - NF_INET_FORWARD (mark 0xAF00): L3 routed IPv4/IPv6 flows.
+    Extracts NAT reply tuples from conntrack. Works for wired (HWNAT),
+    WiFi with WED (CDM4 auto-detected via dev_fill_forward_path), and
+    WiFi without WED (6GHz loopback via GDM2).
+
+  - NF_BR_FORWARD (mark 0xAF01): L2 bridged flows (wired↔WiFi).
+    Creates PPE_PKT_TYPE_BRIDGE entries in ppe->l2_flows. The PPE's
+    existing unbind mechanism creates L3/L4 subflows on demand.
+
+For WiFi interfaces where WED is broken (6GHz HWRRO V3 vs V3.1
+mismatch), the worker automatically falls back to NPU loopback: the
+PPE rewrites headers and routes to GDM2, the CPU bridge-forwards the
+already-rewritten packet to WiFi. This achieves NPU offloading at
+~10% CPU (bridge forwarding only) vs 100% CPU (full routing/NAT).
+
+Also increases AIROHA_RX_HEADROOM in airoha_eth.c for future native
+XDP support.
+
+Signed-off-by: Joel Wiramu Pauling <aenertia@aenertia.net>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c |   7 +-
+ drivers/net/ethernet/airoha/airoha_ppe.c | 330 ++++++++++++++++++++++
+ 2 files changed, 336 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -18,7 +18,12 @@
+-#define AIROHA_RX_HEADROOM		(NET_SKB_PAD + NET_IP_ALIGN)
++/*
++ * Increase Rx headroom to support bpf_xdp_adjust_meta() and future
++ * native XDP. 256 bytes is the standard XDP_PACKET_HEADROOM.
++ */
++#define AIROHA_RX_HEADROOM		(XDP_PACKET_HEADROOM + NET_SKB_PAD + \
++					 NET_IP_ALIGN)
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -5,6 +5,12 @@
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+ 
++#include <net/netfilter/nf_conntrack.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_bridge.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++
+ static DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
+ 
+@@ -35,6 +41,320 @@
+  * ... existing airoha_ppe.c code ...
+  */
+ 
++/* ================================================================
++ * eBPF Soft Hook: Netfilter interception for selective NPU
++ * flow programming.
++ *
++ * Two hooks:
++ *   NF_INET_FORWARD (0xAF00) - L3 routed IPv4/IPv6 (wired + WiFi)
++ *   NF_BR_FORWARD   (0xAF01) - L2 bridged (wired↔WiFi)
++ *
++ * Three offload paths:
++ *   HWNAT     - wired, PPE → GDM port (0% CPU)
++ *   WED       - 2.4/5GHz WiFi, PPE → CDM4 → WED DMA (0% CPU)
++ *   Loopback  - 6GHz WiFi (broken WED), PPE → GDM2 → CPU bridge (10% CPU)
++ * ================================================================ */
+ 
++#define AIROHA_BPF_OFFLOAD_MARK		0xAF00
++#define AIROHA_BPF_BRIDGE_MARK		0xAF01
++
++static struct workqueue_struct *airoha_ebpf_flow_wq;
++static struct nf_hook_ops airoha_ebpf_nf_ops[2];
++
++/* Helper: get pointer to ib2 field regardless of FOE entry type */
++static u32 *airoha_foe_ib2_ptr(struct airoha_foe_entry *foe, int type)
++{
++	if (type == PPE_PKT_TYPE_BRIDGE)
++		return &foe->bridge.ib2;
++	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T)
++		return &foe->ipv6.ib2;
++	return &foe->ipv4.ib2;
++}
++
++/* ----------------------------------------------------------------
++ * Work item for deferred NPU flow programming.
++ * Supports L3 (IPv4/IPv6) and L2 (bridge) flows.
++ * ---------------------------------------------------------------- */
++struct airoha_ebpf_flow_work {
++	struct work_struct work;
++	struct airoha_ppe *ppe;
++	struct net_device *out_dev;
++
++	bool is_bridge;		/* true = L2 bridge, false = L3 routed */
++
++	__be16 l3proto;
++	u8 l4proto;
++
++	/* Original direction 5-tuple (L3 flows only) */
++	union {
++		struct {
++			__be32 src_addr;
++			__be32 dst_addr;
++		} v4;
++		struct {
++			struct in6_addr src_addr;
++			struct in6_addr dst_addr;
++		} v6;
++	} orig;
++	__be16 orig_src_port;
++	__be16 orig_dst_port;
++
++	/* NAT reply tuple (IPv4 only; IPv6 does not do NAPT) */
++	struct {
++		__be32 src_addr;
++		__be32 dst_addr;
++	} reply;
++	__be16 reply_src_port;
++	__be16 reply_dst_port;
++
++	/* L2 MAC addresses */
++	u8 smac[ETH_ALEN];
++	u8 dmac[ETH_ALEN];
++};
++
++/*
++ * Try to prepare a FOE entry for the given egress device.
++ * If the device is WiFi without working WED (6GHz HWRRO V3 mismatch),
++ * airoha_ppe_foe_entry_prepare() returns -EINVAL. In that case, fall
++ * back to NPU loopback via GDM2: the PPE rewrites headers and sends
++ * the packet back to the CPU, which bridge-forwards it to WiFi.
++ */
++static int airoha_ebpf_prepare_foe_with_fallback(struct airoha_eth *eth,
++						  struct airoha_foe_entry *foe,
++						  struct net_device *out_dev,
++						  int type,
++						  struct airoha_flow_data *data,
++						  u8 l4proto)
++{
++	int err;
++	u32 *ib2;
++
++	err = airoha_ppe_foe_entry_prepare(eth, foe, out_dev,
++					   type, data, l4proto);
++	if (err != -EINVAL)
++		return err;
++
++	/*
++	 * Egress device is neither a GDM port nor a working WDMA device.
++	 * This is the 6GHz WiFi case. Use NPU loopback: prepare with
++	 * NULL device (no PSE port set), then override to GDM2.
++	 */
++	err = airoha_ppe_foe_entry_prepare(eth, foe, NULL,
++					   type, data, l4proto);
++	if (err)
++		return err;
++
++	ib2 = airoha_foe_ib2_ptr(foe, type);
++	*ib2 &= ~AIROHA_FOE_IB2_PSE_PORT;
++	*ib2 |= FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM2);
++
++	return 0;
++}
++
++/* ----------------------------------------------------------------
++ * Worker: program a flow into the NPU TCAM.
++ * Handles L3 (IPv4 HNAPT/ROUTE, IPv6 5T) and L2 (BRIDGE) flows.
++ * WiFi WED auto-detected; 6GHz falls back to GDM2 loopback.
++ * ---------------------------------------------------------------- */
++static void airoha_ebpf_flow_prog_worker(struct work_struct *work)
++{
++	struct airoha_ebpf_flow_work *fw =
++		container_of(work, struct airoha_ebpf_flow_work, work);
++	struct airoha_ppe *ppe = fw->ppe;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_flow_data data = {};
++	struct airoha_foe_entry foe;
++	int type, err;
++	u32 hash;
++
++	/* Ensure NPU is initialized (lazy init under mutex) */
++	mutex_lock(&flow_offload_mutex);
++	if (!eth->npu) {
++		err = airoha_ppe_offload_setup(eth);
++		if (err) {
++			mutex_unlock(&flow_offload_mutex);
++			goto out;
++		}
++	}
++	mutex_unlock(&flow_offload_mutex);
++
++	/* Populate L2 MAC addresses */
++	memcpy(data.eth.h_source, fw->smac, ETH_ALEN);
++	memcpy(data.eth.h_dest, fw->dmac, ETH_ALEN);
++
++	if (fw->is_bridge) {
++		/* --- L2 bridge path --- */
++		struct airoha_flow_table_entry *e;
++
++		type = PPE_PKT_TYPE_BRIDGE;
++
++		err = airoha_ebpf_prepare_foe_with_fallback(
++				eth, &foe, fw->out_dev,
++				type, &data, 0);
++		if (err)
++			goto out;
++
++		/* Insert into ppe->l2_flows rhashtable under ppe_lock.
++		 * The PPE unbind mechanism (airoha_ppe_check_skb)
++		 * creates L3/L4 subflows on demand. */
++		e = kzalloc(sizeof(*e), GFP_KERNEL);
++		if (!e)
++			goto out;
++
++		INIT_HLIST_HEAD(&e->l2_flows);
++		memcpy(&e->data, &foe, sizeof(e->data));
++		e->type = FLOW_TYPE_L2;
++		e->hash = 0xffff;
++
++		spin_lock_bh(&ppe_lock);
++		err = rhashtable_insert_fast(&ppe->l2_flows, &e->l2_node,
++					     airoha_l2_flow_table_params);
++		spin_unlock_bh(&ppe_lock);
++		if (err) {
++			/* Already exists or table full */
++			kfree(e);
++		}
++	} else {
++		/* --- L3 routed path --- */
++		data.src_port = fw->orig_src_port;
++		data.dst_port = fw->orig_dst_port;
++
++		if (fw->l3proto == htons(ETH_P_IP)) {
++			data.v4.src_addr = fw->orig.v4.src_addr;
++			data.v4.dst_addr = fw->orig.v4.dst_addr;
++
++			if (fw->orig.v4.src_addr != fw->reply.dst_addr ||
++			    fw->orig.v4.dst_addr != fw->reply.src_addr ||
++			    fw->orig_src_port != fw->reply_dst_port ||
++			    fw->orig_dst_port != fw->reply_src_port)
++				type = PPE_PKT_TYPE_IPV4_HNAPT;
++			else
++				type = PPE_PKT_TYPE_IPV4_ROUTE;
++
++			err = airoha_ebpf_prepare_foe_with_fallback(
++					eth, &foe, fw->out_dev,
++					type, &data, fw->l4proto);
++			if (err)
++				goto out;
++
++			airoha_ppe_foe_entry_set_ipv4_tuple(&foe, &data, false);
++
++			if (type == PPE_PKT_TYPE_IPV4_HNAPT) {
++				struct airoha_flow_data nat_data = {};
++
++				nat_data.v4.src_addr = fw->reply.dst_addr;
++				nat_data.v4.dst_addr = fw->reply.src_addr;
++				nat_data.src_port = fw->reply_dst_port;
++				nat_data.dst_port = fw->reply_src_port;
++				airoha_ppe_foe_entry_set_ipv4_tuple(
++						&foe, &nat_data, true);
++			}
++		} else {
++			type = PPE_PKT_TYPE_IPV6_ROUTE_5T;
++
++			data.v6.src_addr = fw->orig.v6.src_addr;
++			data.v6.dst_addr = fw->orig.v6.dst_addr;
++
++			err = airoha_ebpf_prepare_foe_with_fallback(
++					eth, &foe, fw->out_dev,
++					type, &data, fw->l4proto);
++			if (err)
++				goto out;
++
++			airoha_ppe_foe_entry_set_ipv6_tuple(&foe, &data);
++		}
++
++		hash = airoha_ppe_foe_get_entry_hash(&foe);
++		if (hash < PPE_NUM_ENTRIES)
++			airoha_ppe_foe_commit_entry(ppe, &foe, hash);
++	}
++
++out:
++	dev_put(fw->out_dev);
++	kfree(fw);
++}
++
++/* ----------------------------------------------------------------
++ * NF_INET_FORWARD hook: L3 routed flows (IPv4 + IPv6)
++ * ---------------------------------------------------------------- */
++static unsigned int
++airoha_ebpf_nf_forward(void *priv, struct sk_buff *skb,
++			const struct nf_hook_state *state)
++{
++	struct airoha_ppe *ppe = priv;
++	struct airoha_ebpf_flow_work *fw;
++	enum ip_conntrack_info ctinfo;
++	struct nf_conn *ct;
++	struct nf_conntrack_tuple *reply;
++
++	if (skb->mark != AIROHA_BPF_OFFLOAD_MARK)
++		return NF_ACCEPT;
++
++	skb->mark = 0;
++
++	if (!ppe || !state->out)
++		return NF_ACCEPT;
++
++	ct = nf_ct_get(skb, &ctinfo);
++	if (!ct)
++		return NF_ACCEPT;
++
++	fw = kzalloc(sizeof(*fw), GFP_ATOMIC);
++	if (!fw)
++		return NF_ACCEPT;
++
++	fw->ppe = ppe;
++	fw->out_dev = state->out;
++	fw->is_bridge = false;
++	dev_hold(fw->out_dev);
++
++	if (skb->protocol == htons(ETH_P_IP)) {
++		struct iphdr *iph = ip_hdr(skb);
++		__be16 _ports[2], *ports;
++		int l4off;
++
++		fw->l3proto = htons(ETH_P_IP);
++		fw->l4proto = iph->protocol;
++		fw->orig.v4.src_addr = iph->saddr;
++		fw->orig.v4.dst_addr = iph->daddr;
++
++		if (iph->protocol != IPPROTO_TCP &&
++		    iph->protocol != IPPROTO_UDP)
++			goto free_work;
++
++		/* Safe port extraction for non-linear skbs */
++		l4off = skb_network_offset(skb) + (iph->ihl * 4);
++		ports = skb_header_pointer(skb, l4off, sizeof(_ports), _ports);
++		if (!ports)
++			goto free_work;
++		fw->orig_src_port = ports[0];
++		fw->orig_dst_port = ports[1];
++
++		reply = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
++		fw->reply.src_addr = reply->src.u3.ip;
++		fw->reply.dst_addr = reply->dst.u3.ip;
++		fw->reply_src_port = reply->src.u.tcp.port;
++		fw->reply_dst_port = reply->dst.u.tcp.port;
++
++	} else if (skb->protocol == htons(ETH_P_IPV6)) {
++		struct ipv6hdr *ip6h = ipv6_hdr(skb);
++		__be16 _ports[2], *ports;
++		int l4off;
++
++		fw->l3proto = htons(ETH_P_IPV6);
++		fw->l4proto = ip6h->nexthdr;
++		fw->orig.v6.src_addr = ip6h->saddr;
++		fw->orig.v6.dst_addr = ip6h->daddr;
++
++		/* Only handle direct TCP/UDP nexthdr (no extension headers) */
++		if (ip6h->nexthdr != IPPROTO_TCP &&
++		    ip6h->nexthdr != IPPROTO_UDP)
++			goto free_work;
++
++		l4off = skb_network_offset(skb) + sizeof(*ip6h);
++		ports = skb_header_pointer(skb, l4off, sizeof(_ports), _ports);
++		if (!ports)
++			goto free_work;
++		fw->orig_src_port = ports[0];
++		fw->orig_dst_port = ports[1];
++	} else {
++		goto free_work;
++	}
++
++	if (skb_mac_header_was_set(skb)) {
++		struct ethhdr *ehdr = eth_hdr(skb);
++
++		memcpy(fw->smac, ehdr->h_source, ETH_ALEN);
++		memcpy(fw->dmac, ehdr->h_dest, ETH_ALEN);
++	}
++
++	INIT_WORK(&fw->work, airoha_ebpf_flow_prog_worker);
++	queue_work(airoha_ebpf_flow_wq, &fw->work);
++	return NF_ACCEPT;
++
++free_work:
++	dev_put(fw->out_dev);
++	kfree(fw);
++	return NF_ACCEPT;
++}
++
++/* ----------------------------------------------------------------
++ * NF_BR_FORWARD hook: L2 bridged flows (wired↔WiFi)
++ * ---------------------------------------------------------------- */
++static unsigned int
++airoha_ebpf_nf_br_forward(void *priv, struct sk_buff *skb,
++			   const struct nf_hook_state *state)
++{
++	struct airoha_ppe *ppe = priv;
++	struct airoha_ebpf_flow_work *fw;
++	struct ethhdr *ehdr;
++
++	if (skb->mark != AIROHA_BPF_BRIDGE_MARK)
++		return NF_ACCEPT;
++
++	skb->mark = 0;
++
++	if (!ppe || !state->out)
++		return NF_ACCEPT;
++
++	if (!skb_mac_header_was_set(skb))
++		return NF_ACCEPT;
++
++	ehdr = eth_hdr(skb);
++	if (is_multicast_ether_addr(ehdr->h_dest))
++		return NF_ACCEPT;
++
++	fw = kzalloc(sizeof(*fw), GFP_ATOMIC);
++	if (!fw)
++		return NF_ACCEPT;
++
++	fw->ppe = ppe;
++	fw->out_dev = state->out;
++	fw->is_bridge = true;
++	dev_hold(fw->out_dev);
++
++	memcpy(fw->smac, ehdr->h_source, ETH_ALEN);
++	memcpy(fw->dmac, ehdr->h_dest, ETH_ALEN);
++
++	INIT_WORK(&fw->work, airoha_ebpf_flow_prog_worker);
++	queue_work(airoha_ebpf_flow_wq, &fw->work);
++	return NF_ACCEPT;
++}
++
+ /* ... rest of existing airoha_ppe.c ... */
+ 
+ int airoha_ppe_init(struct airoha_eth *eth)
+@@ -900,6 +1220,30 @@ int airoha_ppe_init(struct airoha_eth *e
+ 	if (err)
+ 		goto free_foe;
+ 
++	/* eBPF soft hook: register NF hooks and workqueue */
++	airoha_ebpf_flow_wq = alloc_workqueue("airoha_ebpf", WQ_UNBOUND, 0);
++	if (!airoha_ebpf_flow_wq) {
++		err = -ENOMEM;
++		goto free_foe;
++	}
++
++	/* Hook 0: L3 routed flows (IPv4 + IPv6) */
++	airoha_ebpf_nf_ops[0].hook = airoha_ebpf_nf_forward;
++	airoha_ebpf_nf_ops[0].pf = NFPROTO_INET;
++	airoha_ebpf_nf_ops[0].hooknum = NF_INET_FORWARD;
++	airoha_ebpf_nf_ops[0].priority = NF_IP_PRI_LAST;
++	airoha_ebpf_nf_ops[0].priv = ppe;
++
++	/* Hook 1: L2 bridged flows (wired↔WiFi) */
++	airoha_ebpf_nf_ops[1].hook = airoha_ebpf_nf_br_forward;
++	airoha_ebpf_nf_ops[1].pf = NFPROTO_BRIDGE;
++	airoha_ebpf_nf_ops[1].hooknum = NF_BR_FORWARD;
++	airoha_ebpf_nf_ops[1].priority = NF_BR_PRI_LAST;
++	airoha_ebpf_nf_ops[1].priv = ppe;
++
++	err = nf_register_net_hooks(&init_net, airoha_ebpf_nf_ops, 2);
++	if (err) {
++		destroy_workqueue(airoha_ebpf_flow_wq);
++		airoha_ebpf_flow_wq = NULL;
++		/* Non-fatal: L3/L2 offloading won't work but system boots */
++		pr_warn("airoha_ppe: failed to register eBPF NF hooks: %d\n", err);
++	}
++
+ 	eth->ppe = ppe;
+ 
+@@ -920,6 +1264,14 @@ void airoha_ppe_deinit(struct airoha_eth
+ 	if (!eth->ppe)
+ 		return;
+ 
++	/* eBPF soft hook: unregister NF hooks and drain workqueue */
++	nf_unregister_net_hooks(&init_net, airoha_ebpf_nf_ops, 2);
++	if (airoha_ebpf_flow_wq) {
++		flush_workqueue(airoha_ebpf_flow_wq);
++		destroy_workqueue(airoha_ebpf_flow_wq);
++		airoha_ebpf_flow_wq = NULL;
++	}
++
+ 	debugfs_remove(eth->ppe->debugfs_dir);

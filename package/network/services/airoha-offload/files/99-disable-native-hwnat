@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright: Joel Wirāmu Pauling <aenertia@aenertia.net>
+#
+# Artifact Name: 99-disable-native-hwnat
+# Purpose: UCI defaults script to run on first boot. Permanently disables native
+#          Netfilter HWNAT to grant the eBPF Soft Hook exclusive NPU TCAM control.
+
+uci -q batch <<EOF
+set firewall.@defaults[0].flow_offloading='1'
+set firewall.@defaults[0].flow_offloading_hw='0'
+commit firewall
+EOF
+
+/etc/init.d/firewall restart
+exit 0
