@@ -9,7 +9,7 @@
 
 / {
 	model = "Gemtek W1700K (OpenWrt U-Boot layout)";
-	compatible = "gemtek,w1700k-ubi", "airoha,an7581", "airoha,en7581";
+	compatible = "gemtek,w1700k-ubi", "airoha,an7581", "airoha,en7581","xr1710g";
 
 	aliases {
 		serial0 = &uart1;
@@ -406,4 +406,24 @@
 	status = "okay";
 	pinctrl-names = "default";
 	pinctrl-0 = <&hsuart_pins>;
+};
+
+&cpu0 {
+	power-domains = <&scpsys 7>;
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu1 {
+	power-domains = <&scpsys 7>;
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu2 {
+	power-domains = <&scpsys 7>;
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu3 {
+	power-domains = <&scpsys 7>;
+	operating-points-v2 = <&cpu_opp_table>;
 };
